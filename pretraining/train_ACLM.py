@@ -15,10 +15,12 @@ import copy
 from datetime import timedelta
 import numpy as np
 import pandas as pd
+import random
 
 #from config import default_args
 from lmprobs import TrigramSurprisalSpace
-from lmprobs import GPTBertSurprisalSpace
+from lmprobs import AbstractSurprisalSpace
+from sklearn.neighbors import KDTree
 
 import torch
 import torch.nn as nn
@@ -29,7 +31,7 @@ import torch.nn.functional as F
 from lamb import Lamb
 from model_extra import Bert
 from utils import cosine_schedule_with_warmup_cooldown, is_main_process, get_rank, seed_everything, get_world_size
-from dataset_ACLM import MaskedDataset, CausalDataset, ValidationDataset
+from dataset_ACLM_new import MaskedDataset, CausalDataset, ValidationDataset
 from model_logging import ModelLogger
 
 
@@ -42,7 +44,7 @@ def parse_arguments():
 
     parser.add_argument("--train_path", default="/mimer/NOBACKUP/groups/naiss2024-6-297/gpt-bert/data/train_10M.txt", type=str, help="Path to the training data.")
     parser.add_argument("--valid_path", default="/mimer/NOBACKUP/groups/naiss2024-6-297/gpt-bert/data/dev_10M.txt", type=str, help="Path to the validation data.")
-    parser.add_argument("--name", default="test_babylm_10M", type=str, help="Name of the run.")
+    parser.add_argument("--name", default="1_2_babylm_10M", type=str, help="Name of the run.")
     parser.add_argument("--config_file", default="/mimer/NOBACKUP/groups/naiss2024-6-297/gpt-bert/configs/small.json", type=str, help="The BERT model config")
     parser.add_argument("--tokenizer_path", default="/mimer/NOBACKUP/groups/naiss2024-6-297/gpt-bert/tokenizers/tokenizer_10M_new.json", type=str, help="Path to the tokenizer.")
     parser.add_argument("--output_dir", default="/mimer/NOBACKUP/groups/naiss2024-6-297/gpt-bert/model_checkpoints", type=str, help="The output directory where the model checkpoints will be written.")
@@ -224,6 +226,52 @@ def prepare_model_and_optimizer(args):
 
     return model, ema_model, optimizer, scheduler, global_step, epoch
 
+
+class GPTBertSurprisalSpace(AbstractSurprisalSpace):
+    def __init__(self,dims, dataloader,model):
+        super().__init__(dims)
+        self.dataloader = dataloader
+        self.model=model
+
+    def train(self, sequences):
+        return None
+
+    def fit(self):
+        print("Building surprisal space using GPT model.")
+        self.surprisalvecs = self.surprisalizer_()
+        #self.surprisalvecs = np.stack(self.surprisalvecs)
+        #self.surprisalvecs = list(self.surprisalvecs)
+        self.currentsurprisalvecs = self.surprisalvecs.copy()
+        self.filtered_to_original = list(range(len(self.surprisalvecs)))
+        #self.surprisalvecs = np.stack(self.surprisalvecs)
+        print("Building KD Tree.")
+        self.nnfinder = KDTree(self.surprisalvecs)
+
+        return self.surprisalvecs
+
+    def surprisalizer_(self):
+        surprisals = []
+        dataloader = iter(self.dataloader)
+        self.model.eval()
+        with torch.no_grad():
+            for local_step in tqdm(range(len(dataloader)),desc="ACLM num steps"):
+                input_ids_, attention_mask_, target_ids_, mask_p_ = get_batch(dataloader,args.device, 0)
+                print(len(dataloader))
+                with torch.cuda.amp.autocast(args.mixed_precision, dtype=torch.bfloat16):
+                    prediction = model(input_ids_, attention_mask_, target_ids_,return_all=True)
+                    print(prediction.size())
+                    #prediction = prediction.flatten(0, 1)
+                    #print(prediction.size())
+                    target_ids= target_ids_.flatten()
+                    
+                    loss = F.cross_entropy(
+                            prediction, target_ids, reduction='none')
+                    print(loss.size())
+                    #surprisal = loss.view(2, -1)
+                    loss_np = loss.detach().cpu().numpy()
+                    surprisals.append(loss_np)
+                    print(len(surprisals))
+        return surprisals
 
 def get_batch(dataloader, device, global_step):
     dataloader._dataset.set_global_step(global_step)
@@ -524,31 +572,32 @@ if __name__ == "__main__":
     # Load ACLM data
     
     train_data_df = pd.read_csv("../data/train_10M.csv")
+    print(train_data_df.shape[0])
     max_iteration = float(train_data_df.shape[0] - INITIAL_SAMPLE) / SAMPLE_PER_ITER
 
     print("TSS_SAMPLE_SIZE: ", TSS_SAMPLE_SIZE)
     print("SAMPLE_PER_ITER: ", SAMPLE_PER_ITER)
     print("max_iteration: ", max_iteration)
-    
+    print("Initial sample", INITIAL_SAMPLE)
     #with model.join(divide_by_initial_world_size=False):
     pool = train_data_df['index'].to_numpy()
     print(pool.shape)
     #tss = pickle.load(open("../surprisals_8.pkl", "rb"))
     with open('./surprisals_8.pkl', 'rb') as f:
         tss = pickle.load(f)
-    print("After loading filtered_to_original:", getattr(tss, 'filtered_to_original', None))
+    #print("After loading filtered_to_original:", getattr(tss, 'filtered_to_original', None))
     #tss = TrigramSurprisalSpace(8)
     
-    if args.rank==0:
-        initial_indices = np.random.choice(len(train_data_df), INITIAL_SAMPLE, replace=False)
-        #print(initial_indices)
-        initial_indices_tensor = torch.tensor(initial_indices, dtype=torch.int64, device=args.device)
+    #if args.rank==0:
+    initial_indices = np.random.choice(len(train_data_df), INITIAL_SAMPLE, replace=False)
+    #print(initial_indices)
+    #initial_indices_tensor = torch.tensor(initial_indices, dtype=torch.int64, device=args.device)
 
-    else:
-         initial_indices_tensor = torch.empty(INITIAL_SAMPLE, dtype=torch.int64, device=args.device)
+    #else:
+    #initial_indices_tensor = torch.empty(INITIAL_SAMPLE, dtype=torch.int64, device=args.device)
 
-    torch.distributed.broadcast(initial_indices_tensor, src=0)
-    initial_indices = initial_indices_tensor.tolist()
+    #torch.distributed.broadcast(initial_indices_tensor, src=0)
+    #initial_indices = initial_indices_tensor.tolist()
     with open('initial.txt', 'w') as file:
         for item in initial_indices:
             file.write(f"{item}\n")
@@ -564,74 +613,33 @@ if __name__ == "__main__":
     initial_set = set(initial_indices)
     remaining_set = set(remaining_indices)
     common_indices = initial_set.intersection(remaining_set)
-
-    if not common_indices:
-            print("✅ All initial_indices were successfully removed from remaining_df.")
-    else:
-            print("❌ Some indices from initial_indices are still in remaining_df:", common_indices)
             
-    #tss_new = TrigramSurprisalSpace(8)
-    #tokens = [row.split(" ") for row in remaining_df["Tokens"]]
-    #tss_new.fit(tokens)
-    #print(f"tss size: {len(tss_new.nnfinder.data)}")
-    #distances, indices, vectors = tss_new.find_index_df(3999,remaining_df)
-
-    #print("We get distances {} at indices {}.\nThe vectors are:\n{}".format(distances, indices, vectors))
     split = 0
     convergence_criterion_not_met = True
     for epoch in count(start=start_epoch):
         print(f" epoch: {epoch}")
         print("## ************ start ACLM epoch: {}**********".format(epoch), )
         
-        #pool = train_data_df['Index'].to_numpy()
-        #tss = pickle.load(open("../surprisals_8.pkl", "rb"))
-        #initial_indices = np.random.choice(pool, INITIAL_SAMPLE, replace=False)
-        
-        #pool = np.delete(pool, initial_indices)
-        #tss.remove_from_space(initial_indices)
-        #sampled_train_data_df = train_data_df.loc[initial_indices,:]
-        
-        #split = 0
-        #convergence_criterion_not_met = True
         train_dataloader, valid_dataloader = load_datasets(args,sampled_train_data_df, tokenizer, epoch, global_step, train_dataloader, valid_dataloader)
         #print("loaded successfully")
         global_step = training_epoch(model, ema_model, train_dataloader, valid_dataloader, optimizer, scheduler, global_step, epoch, args)
         print(f"finished training epoch global step taken rank: {args.rank}")
         print("#### **** start ACLM surprisal computing ******")
         if epoch == 0:
-            #if args.rank==0:
-            #    if TSS_SAMPLE_SIZE > 0:
-            #        print(TSS_SAMPLE_SIZE)
-                    #print(len(remaining_df))
-            #        sampled_indices = np.random.choice(remaining_df['index'], TSS_SAMPLE_SIZE, replace=False)
-            #    else:
-            #        sampled_indices = np.random.choice(remaining_df['index'], len(train_data_df), replace=False)
-        
-            #    sampled_indices_tensor = torch.tensor(sampled_indices, dtype=torch.int64, device=args.device)
-            #else:
-            #    if TSS_SAMPLE_SIZE > 0:
-            #        sampled_indices_tensor = torch.empty(TSS_SAMPLE_SIZE, dtype=torch.int64, device=args.device)
-            #    else:
-            #        sampled_indices_tensor = torch.empty(remaining_df['index'], dtype=torch.int64, device=args.device)
-
-            #torch.distributed.broadcast(sampled_indices_tensor, src=0)
-
-            #sampled_indices = sampled_indices_tensor.tolist()
-
-            #with open('my_list.txt', 'w') as file:
-            #    for item in sampled_indices:
-            #        file.write(f"{item}\n")
-
+            
             surprisal_by_group = []
-            #missing_indices = [idx for idx in sampled_indices if idx not in remaining_df['index']]
-
-            #if not missing_indices:
-            #    print("All sampled indices exist in sampled_df.")
-            #else:
-            #    print(f"Missing indices in surprisal: {missing_indices}")
-            #sampled_df = remaining_df.loc[sampled_indices,:]
-            #remaining_df= remaining_df.drop(sampled_indices)
-            sampled_dataloader, valid_dataloader = load_datasets(args,sampled_train_data_df, tokenizer, epoch, global_step, train_dataloader, valid_dataloader)
+            
+            #sampled_dataloader, valid_dataloader = load_datasets(args,sampled_train_data_df, tokenizer, epoch, global_step, train_dataloader, valid_dataloader)
+            surprisal_data = ValidationDataset(sampled_train_data_df, tokenizer, args)
+            sampled_dataloader = DataLoader(
+                surprisal_data,
+                shuffle=False,
+                batch_size=256,
+                num_workers=0,  # non-zero num_workers causes segmenation fault
+                generator=torch.Generator().manual_seed(42),
+                drop_last=False,
+                pin_memory=True,
+                )
             sampled_seed = args.seed + get_rank() + epoch * get_world_size()
                 
             model = model.eval()
@@ -655,26 +663,21 @@ if __name__ == "__main__":
 
                     print(f" loss {loss.size()}")
 
-                    batch_size, seq_length = target_ids_.size()
+                    seq_length, batch_size = target_ids_.size()
                     print(batch_size,seq_length)
 
-                    #surprisal = torch.zeros(batch_size * seq_length, device=loss.device)
-                    #surprisal = surprisal.to(loss.dtype)
-                    #surprisal[valid_indices] = loss
-
-                    surprisal = loss.view(batch_size, -1)
+                    
+                    loss = loss.view(seq_length, batch_size)
+                    surprisal = loss.transpose(0, 1)
                     print(f" surprisal after reshaping: {surprisal.shape}")
                     
-                    #count valid tokens per sequence
-                    #valid_tokens_per_seq = (target_ids_ != -100).sum(dim=1)
-                    #print(f" valid tokens {len(valid_tokens_per_seq)}")
-                    
-                    mean_surprisal = surprisal.sum(dim=1) 
+                                        
+                    mean_surprisal = surprisal.mean(dim=1) 
                     
                     print(f"mean_surprisal: {mean_surprisal.shape}")
 
                     surprisals = mean_surprisal.tolist()
-                surprisal_by_group += surprisals
+                    surprisal_by_group += surprisals
                 print("len(surprisal_by_group)",len(surprisal_by_group))
                 print("len(sampled_dataloader)",len(sampled_dataloader))
                 print("#### **** end ACLM surprisal computing ******")
@@ -687,86 +690,358 @@ if __name__ == "__main__":
             
                 print('most_confused_index', most_confused_index)
             
-                #_, indices, _ = tss.find_index(most_confused_index, k=SAMPLE_PER_ITER) 
+                #if args.rank==0:
+                #print(len(remaining_df))
+                print(f"size of tss: {len(tss.nnfinder.data)}")
+                _, indices, _ = tss.find_index(most_confused_index, k=SAMPLE_PER_ITER)
                 #print(indices)
-                #print('len(indices)', len(indices))
-                if args.rank==0:
-                    #print(len(remaining_df))
-                    print(f"size of tss: {len(tss.nnfinder.data)}")
-                   # initial_indices = []
-                   # with open('initial.txt', 'r') as file:
-                   #      for line in file:
-                   #          initial_indices.append(int(line.strip()))
-                             
-                   # tss.remove_from_space(initial_indices)
-                   # print(f"size of tss: {len(tss.nnfinder.data)}")
-                    _, indices, _ = tss.find_index(most_confused_index, k=SAMPLE_PER_ITER)
-                    #print(indices)
-                    print('len(indices)', len(indices))
-                    #print('pool.shape', pool.shape)
-                    #pool = np.delete(pool, indices)
-    
-                    #print('pool.shape', pool.shape)
-            
-                    # Take things out of the space.
-                    tss.remove_from_space(indices)
-                    print('tss size', len(tss.nnfinder.data))
-                   # indices = list(indices)
-                    with open('indices.txt', 'w') as file:
-                        for item in indices:
-                            file.write(f"{item}\n")
+                #indices = torch.tensor(indices, dtype=torch.long, device='cuda')
+                #    print('len(indices)', len(indices))
+                #else:
+                #    indices = torch.empty(SAMPLE_PER_ITER, dtype=torch.long, device='cuda')
+
+                #torch.distributed.broadcast(indices, src=0)
+                #indices = indices.cpu().tolist()
+                # Take things out of the space.
+                tss.remove_from_space(indices)
+                print('tss size', len(tss.nnfinder.data))
+                # indices = list(indices)
+                with open('indices.txt', 'w') as file:
+                    for item in indices:
+                        file.write(f"{item}\n")
                     print(len(indices))
             
-                    #print(len(remaining_df))
-                    if any(item in initial_indices for item in indices):
-                        print("At least one element of list1 is in list2.")
-                    else:
-                        print("No elements of list1 are in list2.")
-                    if any(item in initial_indices for item in remaining_df['index']):
-                        print(item)
-                    else:
-                        print("no element in remaining_df from initial")
-                    missing = [idx for idx  in indices if idx not in remaining_df.index]
-                    initial_in_missing = [idx for idx in missing if idx in initial_indices]
-                    print(f" missing indices that are in initial: {initial_in_missing}")
-                    sampled_train_data_df = remaining_df.loc[indices,:]
-                    #explicit_indices = remaining_df.iloc[indices].index
-                    remaining_df = train_data_df.drop(indices)
+                
+                if any(item in initial_indices for item in indices):
+                    print("At least one element of list1 is in list2.")
+                else:
+                    print("No elements of list1 are in list2.")
+                if any(item in initial_indices for item in remaining_df['index']):
+                    print(item)
+                else:
+                    print("no element in remaining_df from initial")
+                missing = [idx for idx  in indices if idx not in remaining_df.index]
+                initial_in_missing = [idx for idx in missing if idx in initial_indices]
+                print(f" missing indices that are in initial: {initial_in_missing}")
+                sampled_train_data_df = remaining_df.loc[indices,:]
+                #explicit_indices = remaining_df.iloc[indices].index
+                remaining_df = remaining_df.drop(indices).reset_index(drop=True)
                 print(len(sampled_train_data_df))
                 print(len(remaining_df))
-        else:
+        elif epoch == 1:
             print(len(sampled_train_data_df))
+            print("remaining df",len(remaining_df))
+            
+            #if args.rank == 0:
             surprisal_data = ValidationDataset(remaining_df, tokenizer, args)
-
+            print(len(surprisal_data))
             surp_dataloader = DataLoader(
-            surprisal_data,
-            shuffle=False,
-            batch_size=1,
-            num_workers=0,  # non-zero num_workers causes segmenation fault
-            generator=torch.Generator().manual_seed(42),
-            drop_last=True,
-            pin_memory=True,
+                surprisal_data,
+                shuffle=False,
+                batch_size=1,
+                num_workers=0,  # non-zero num_workers causes segmenation fault
+                generator=torch.Generator().manual_seed(42),
+                drop_last=False,
+                pin_memory=True,
             )
 
             tss_gpt = GPTBertSurprisalSpace(0,surp_dataloader,model)
-            seq = sampled_train_data_df["Tokens"].tolist()
-            tss_gpt.fit(seq)
+            #seq = remaining_df["Tokens"].tolist()
+            tss_gpt.fit()
             pickle.dump(tss_gpt, open("surprisals_gpt.pkl", "wb"))
-            distances, indices, vectors = tss_gpt.find_index_df(30,remaining_df)
+            print(f"Original size: {len(tss_gpt.surprisalvecs)}")
 
-            print("We get distances {} at indices {}.\nThe vectors are:\n{}".format(distances, indices, vectors))
+            surprisal_by_group = []
+            
+            #sampled_dataloader, valid_dataloader = load_datasets(args,sampled_train_data_df, tokenizer, epoch, global_step, train_dataloader, valid_dataloader)
+            surprisal_data = ValidationDataset(sampled_train_data_df, tokenizer, args)
+            sampled_dataloader = DataLoader(
+                surprisal_data,
+                shuffle=False,
+                batch_size=256,
+                num_workers=0,  # non-zero num_workers causes segmenation fault
+                generator=torch.Generator().manual_seed(42),
+                drop_last=False,
+                pin_memory=True,
+            )
+            sampled_seed = args.seed + get_rank() + epoch * get_world_size()
+                
+            model = model.eval()
+                
+            sampled_dataloader = iter(sampled_dataloader)
 
+            with torch.no_grad():
+                for local_step in tqdm(range(len(sampled_dataloader)),desc="ACLM num steps"):
+                    input_ids_, attention_mask_, target_ids_, mask_p_ = get_batch(sampled_dataloader, args.device, 0)
+                    with torch.cuda.amp.autocast(args.mixed_precision, dtype=torch.bfloat16):
+                        prediction = model(input_ids_, attention_mask_, target_ids_,return_all=True)
+                        print(prediction.shape)
+                        
+                        target_ids= target_ids_.flatten()
+                        
+                        print(f"Prediction shape: {prediction.shape}, Target shape: {target_ids.shape}")
+                        loss = F.cross_entropy(
+                        prediction, target_ids, reduction='none')
+
+                        print(f" loss {loss.size()}")
+
+                        seq_length, batch_size = target_ids_.size()
+                        print(batch_size,seq_length)
+
+                        loss = loss.view(seq_length, batch_size)
+                        surprisal = loss.transpose(0, 1)
+                        print(f" surprisal after reshaping: {surprisal.shape}")
+
+                        mean_surprisal = surprisal.mean(dim=1)
+
+                        print(f"mean_surprisal: {mean_surprisal.shape}")
+
+                        surprisals = mean_surprisal.tolist()
+                        surprisal_by_group += surprisals
+                        print("len(surprisal_by_group)",len(surprisal_by_group))
+                        print("len(sampled_dataloader)",len(sampled_dataloader))
+                        print("#### **** end ACLM surprisal computing ******")
+
+                surprisal_array = np.array(surprisal_by_group)
+                print('surprisal_array.shape', surprisal_array.shape)
+                with open('indices1.txt', 'w') as file:
+                    for item in indices:
+                        file.write(f"{item}\n")
+                    print(len(indices))
+                max_surprisal_idx = surprisal_array.argmax()
+                print(max_surprisal_idx)
+                print(len(indices))
+                most_confused_index = indices[max_surprisal_idx]
+                    
+                print('most_confused_index', most_confused_index)
+
+            #if args.rank==0:
+                #print(len(remaining_df))
+            print(f"size of tss: {len(tss_gpt.nnfinder.data)}")
+            _, indices, _ = tss_gpt.find_index(most_confused_index, k=SAMPLE_PER_ITER)
+            #print(indices)
+            #indices = torch.tensor(indices, dtype=torch.long, device='cuda')
+            #    print('len(indices)', len(indices))
+            #else:
+            #    indices = torch.empty(SAMPLE_PER_ITER, dtype=torch.long, device='cuda')
+
+            #torch.distributed.broadcast(indices, src=0)
+            #indices = indices.cpu().tolist()
+            with open("surprisals_gpt.pkl", "rb") as f:
+                tss_gpt = pickle.load(f)
+            # Take things out of the space.
+            tss_gpt.remove_from_space(indices)
+            print('tss size', len(tss_gpt.nnfinder.data))
+            # indices = list(indices)
+            with open('indices.txt', 'w') as file:
+                for item in indices:
+                    file.write(f"{item}\n")
+                print(len(indices))
+
+            #print(len(remaining_df))
+            if any(item in initial_indices for item in indices):
+                print("At least one element of list1 is in list2.")
+            else:
+                print("No elements of list1 are in list2.")
+            if any(item in initial_indices for item in remaining_df['index']):
+                print(item)
+            else:
+                print("no element in remaining_df from initial")
+            missing = [idx for idx  in indices if idx not in remaining_df.index]
+            initial_in_missing = [idx for idx in missing if idx in initial_indices]
+            print(f" missing indices that are in initial: {initial_in_missing}")
+            sampled_train_data_df = remaining_df.loc[indices,:]
+            #explicit_indices = remaining_df.iloc[indices].index
+            remaining_df = remaining_df.drop(indices)
+            print(len(sampled_train_data_df))
+            print(len(remaining_df))
+
+        else:
+            print(len(sampled_train_data_df))
+            print(len(remaining_df))
+            surprisal_by_group = []
+
+            #sampled_dataloader, valid_dataloader = load_datasets(args,sampled_train_data_df, tokenizer, epoch, global_step, train_dataloader, valid_dataloader)
+            surprisal_data = ValidationDataset(sampled_train_data_df, tokenizer, args)
+            sampled_dataloader = DataLoader(
+                surprisal_data,
+                shuffle=False,
+                batch_size=256,
+                num_workers=0,  # non-zero num_workers causes segmenation fault
+                generator=torch.Generator().manual_seed(42),
+                drop_last=False,
+                pin_memory=True,
+            )
+            sampled_seed = args.seed + get_rank() + epoch * get_world_size()
+
+            model = model.eval()
+
+            sampled_dataloader = iter(sampled_dataloader)
+
+            with torch.no_grad():
+                for local_step in tqdm(range(len(sampled_dataloader)),desc="ACLM num steps"):
+                    input_ids_, attention_mask_, target_ids_, mask_p_ = get_batch(sampled_dataloader, args.device, 0)
+                    with torch.cuda.amp.autocast(args.mixed_precision, dtype=torch.bfloat16):
+                        prediction = model(input_ids_, attention_mask_, target_ids_,return_all=True)
+                        print(prediction.shape)
+                        #prediction = prediction.flatten(0, 1)
+                        #print(prediction)
+                        target_ids= target_ids_.flatten()
+                        #valid_indices = target_ids != - 100
+                        #target_ids = target_ids[valid_indices]
+                    print(f"Prediction shape: {prediction.shape}, Target shape: {target_ids.shape}")
+                    loss = F.cross_entropy(
+                            prediction, target_ids, reduction='none')
+
+                    print(f" loss {loss.size()}")
+
+                    seq_length, batch_size = target_ids_.size()
+                    print(batch_size,seq_length)
+
+                    #surprisal = loss.view(batch_size, -1)
+                    loss = loss.view(seq_length, batch_size)
+                    surprisal = loss.transpose(0, 1)
+                    print(f" surprisal after reshaping: {surprisal.shape}")
+
+                    
+                    mean_surprisal = surprisal.mean(dim=1)
+
+                    print(f"mean_surprisal: {mean_surprisal.shape}")
+
+                    surprisals = mean_surprisal.tolist()
+                    surprisal_by_group += surprisals
+                print("len(surprisal_by_group)",len(surprisal_by_group))
+                print("len(sampled_dataloader)",len(sampled_dataloader))
+                print("#### **** end ACLM surprisal computing ******")
+
+                surprisal_array = np.array(surprisal_by_group)
+                print('surprisal_array.shape', surprisal_array.shape)
+
+                max_surprisal_idx = surprisal_array.argmax()
+                most_confused_index = indices[max_surprisal_idx]
+
+                print('most_confused_index', most_confused_index)
+
+                #if args.rank==0:
+                #print(len(remaining_df))
+                print(f"size of tss: {len(tss_gpt.nnfinder.data)}")
+                _, indices, _ = tss_gpt.find_index(most_confused_index, k=SAMPLE_PER_ITER)
+                #print(indices)
+                #indices = torch.tensor(indices, dtype=torch.long, device='cuda')
+                #    print('len(indices)', len(indices))
+                #else:
+                #    indices = torch.empty(SAMPLE_PER_ITER, dtype=torch.long, device='cuda')
+
+                #torch.distributed.broadcast(indices, src=0)
+                #indices = indices.cpu().tolist()
+                # Take things out of the space.
+                print(len(indices))
+                #print(indices)
+                tss_gpt.remove_from_space(indices)
+                print('tss size', len(tss_gpt.nnfinder.data))
+                # indices = list(indices)
+                with open('indices.txt', 'w') as file:
+                    for item in indices:
+                        file.write(f"{item}\n")
+                    print(len(indices))
+
+
+                if any(item in initial_indices for item in indices):
+                    print("At least one element of list1 is in list2.")
+                else:
+                    print("No elements of list1 are in list2.")
+                if any(item in initial_indices for item in remaining_df['index']):
+                    print(item)
+                else:
+                    print("no element in remaining_df from initial")
+                missing = [idx for idx  in indices if idx not in remaining_df.index]
+                initial_in_missing = [idx for idx in missing if idx in initial_indices]
+                print(f" missing indices that are in initial: {initial_in_missing}")
+                sampled_train_data_df = remaining_df.loc[indices,:]
+                #explicit_indices = remaining_df.iloc[indices].index
+                remaining_df = remaining_df.drop(indices)
+                print(len(sampled_train_data_df))
+                print(len(remaining_df))
             
-            
-            
-            
+            '''     
+                # Step 1: Initialize filtered structures
+                # Initially, filtered space is the full space
+                tss_gpt.currentsurprisalvecs = tss_gpt.surprisalvecs.copy()
+                # filtered_to_original maps filtered indices -> original indices
+                tss_gpt.filtered_to_original = list(range(len(tss_gpt.surprisalvecs)))
+                
+                print(f"Filtered size before removal: {len(tss_gpt.currentsurprisalvecs)}")
+                
+                # Step 2: Remove 1000 random indices from currentsurprisalvecs & update mapping
+                to_remove = random.sample(range(len(tss_gpt.currentsurprisalvecs)), 1000)
+                to_remove = sorted(to_remove, reverse=True)  # delete from highest index
+
+                for idx in to_remove:
+                    del tss_gpt.currentsurprisalvecs[idx]
+                    del tss_gpt.filtered_to_original[idx]
+
+                print(f"Filtered size after removal: {len(tss_gpt.currentsurprisalvecs)}")
+                    
+                # Step 3: Rebuild KDTree on filtered vectors
+                #from sklearn.neighbors import KDTree
+                tss_gpt.nnfinder = KDTree(tss_gpt.currentsurprisalvecs)
+
+                # Step 4: Pick an index from original surprisalvecs to query
+                query_index = 5000  # change as needed
+                query_vec = tss_gpt.surprisalvecs[query_index].reshape(1, -1)
+
+                # Step 5: Query neighbors in filtered KDTree
+                distances, indices = tss_gpt.nnfinder.query(query_vec, k=5)
+                indices = indices[0]  # flatten
+
+                print(f"\nQuerying neighbors for original vector index {query_index}")
+                print(f"Returned indices (in filtered space): {indices}")
+
+                # Step 6: Check if neighbors match filtered vectors or original vectors at these indices
+                print("\nCheck neighbor vector matches:")
+                for i in indices:
+                    neighbor_vec = tss_gpt.currentsurprisalvecs[i]
+                    matches_filtered = np.allclose(neighbor_vec, tss_gpt.currentsurprisalvecs[i])
+                    matches_original_same_index = np.allclose(neighbor_vec, tss_gpt.surprisalvecs[i])
+                    # Check if neighbor_vec matches any vector in original surprisalvecs
+                    matches_any_original = any(np.allclose(neighbor_vec, v) for v in tss_gpt.surprisalvecs)
+
+                    print(f"Index in filtered: {i}")
+                    print(f"Matches filtered vector at i? {matches_filtered}")
+                    print(f"Matches original vector at same index? {matches_original_same_index}")
+                    print(f"Matches any original vector? {matches_any_original}")
+                    print(f"Original index of this neighbor: {tss_gpt.filtered_to_original[i]}")
+                    print("------")
+
+                # Step 7: Show mapping from filtered indices back to original indices
+                print("\nFiltered to original index mapping for neighbors:")
+                for i in indices:
+                    print(f"Filtered idx {i} -> Original idx {tss_gpt.filtered_to_original[i]}")
+                    print("\nCheck neighbor vector matches (with actual vector values):")
+                for i in indices:
+                    neighbor_vec = tss_gpt.currentsurprisalvecs[i]
+                    original_index = tss_gpt.filtered_to_original[i]
+                    original_vec = tss_gpt.surprisalvecs[original_index]
+
+                    # Checks
+                    matches_filtered = np.allclose(neighbor_vec, tss_gpt.currentsurprisalvecs[i])
+                    matches_same_index_original = np.allclose(neighbor_vec, tss_gpt.surprisalvecs[i])
+                    matches_mapped_original = np.allclose(neighbor_vec, original_vec)
+                    matches_any_original = any(np.allclose(neighbor_vec, v) for v in tss_gpt.surprisalvecs)
+
+                    print(f"\nFiltered index: {i}")
+                    print(f"  Mapped original index: {original_index}")'''
+
+        
         print("### ******** end ACLM split: {} ********".format(split))
         split += 1
+        epoch += 1
 
         save(model, ema_model, optimizer, scheduler, global_step, epoch, args)
         validation_epoch(model, valid_dataloader, epoch, args, commit=True)
-        if global_step >= args.max_steps:
-            break
+        if split > max_iteration or remaining_df.empty or global_step >= args.max_steps:
+                convergence_criterion_not_met = False
+                break
 
     save(model, ema_model, optimizer, scheduler, global_step, epoch, args)
     validation_epoch(model, valid_dataloader, epoch, args, commit=True)

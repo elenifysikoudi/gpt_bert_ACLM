@@ -1,4 +1,5 @@
 import torch
+import ast
 import random
 import pandas as pd
 import ast
@@ -90,20 +91,22 @@ class MaskedDataset(torch.utils.data.Dataset):
         #documents = [torch.tensor(eval(line.split(": ")[1].strip()), dtype=torch.long) for line in lines if line.strip() ]
         df = input_file
 
-        documents = [torch.tensor(eval(row), dtype=torch.long) for row in df["Tokens"]]
-        
-        self.segments = [
+        self.segments = [torch.tensor(eval(row), dtype=torch.long) for row in df["Tokens"]]
+
+        '''self.segments = [
             document[offset : offset + self.seq_length - 2]
             for document in documents
             for offset in range(0, len(document), self.seq_length - 2)
             if len(document) > 0 and len(document) - offset > 1
-        ]
+        ] '''
+
+        
         #if rank is not None:
         #    self.segments = self.segments[rank::world_size]
-        self.counts = [
-            torch.zeros_like(segment)
-            for segment in self.segments
-        ]
+        #self.counts = [
+        #    torch.zeros_like(segment)
+        #    for segment in self.segments
+        #]
         self.mask_counts = [
             torch.zeros_like(segment)
             for segment in self.segments
@@ -115,25 +118,28 @@ class MaskedDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         tokens = self.segments[index]
-        seq_length = min(self.seq_length, tokens.size(0))
-        tokens = tokens[:seq_length].long()
-        self.counts[index][:seq_length] += 1
+        seq_length = tokens.size(0)
+        #seq_length = min(self.seq_length, tokens.size(0))
+        #tokens = tokens[:seq_length].long()
+        #self.counts[index][:seq_length] += 1
 
-        mask_ratios, replacement_tokens = self.masking_strategy(tokens, self.mask_counts[index][:seq_length])
+        mask_ratios, replacement_tokens = self.masking_strategy(tokens, self.mask_counts[index])#[:seq_length])
         input_ids, target_ids, real_mask_p = self.apply_mask(tokens, mask_ratios, replacement_tokens)
-        self.mask_counts[index][:seq_length][target_ids != -100] += 1
-
-        input_ids = torch.cat([
-            torch.LongTensor([self.cls_index]),
-            input_ids
-        ])
-        target_ids = torch.cat([
-            torch.LongTensor([-100]),
-            target_ids
-        ])
-        attention_mask = torch.ones(seq_length + 1, seq_length + 1, dtype=torch.bool)
-
-        while self.seq_length - input_ids.size(0) > 1:
+        #self.mask_counts[index][:seq_length][target_ids != -100] += 1
+        self.mask_counts[index][target_ids != -100] += 1
+        #input_ids = torch.cat([
+        #    torch.LongTensor([self.cls_index]),
+        #    input_ids
+        #])
+        #target_ids = torch.cat([
+        #    torch.LongTensor([-100]),
+        #    target_ids
+        #])
+        #attention_mask = torch.ones(seq_length + 1, seq_length + 1, dtype=torch.bool)
+        pad_token_id = self.pad_index
+        padding_mask = (tokens != pad_token_id)
+        
+        '''while self.seq_length - input_ids.size(0) > 1:
             index = self.random_index.get_random_index()
             tokens = self.segments[index].long()
             seq_length = min(self.seq_length - input_ids.size(0), tokens.size(0))
@@ -184,8 +190,8 @@ class MaskedDataset(torch.utils.data.Dataset):
             attention_mask = torch.block_diag(
                 attention_mask,
                 torch.zeros(padding_length, padding_length, dtype=torch.bool)
-            )
-
+            )'''
+        attention_mask = padding_mask.unsqueeze(0) & padding_mask.unsqueeze(1)
         attention_mask = ~attention_mask
 
         input_ids = input_ids[:-1]
@@ -196,7 +202,7 @@ class MaskedDataset(torch.utils.data.Dataset):
 
     def set_global_step(self, global_step):
         self.global_step = global_step
-    
+
     def apply_mask(self, input_ids, mask_ratios, replacement_ids):
         mask_p = self.args.mask_p_start + (self.args.mask_p_end - self.args.mask_p_start) * self.global_step / self.args.max_steps
         mask_p = torch.topk(mask_ratios, max(1, int(mask_ratios.size(0) * mask_p + torch.rand(1).item())), largest=False).values.max().item()
@@ -246,28 +252,31 @@ class CausalDataset(torch.utils.data.Dataset):
 
         #documents = [torch.tensor(eval(line.split(": ")[1].strip()), dtype=torch.long) for line in lines if line.strip() ]
         df = input_file
-        documents = [torch.tensor(eval(row), dtype=torch.long) for row in df["Tokens"]]
+        self.segments = [torch.tensor(eval(row), dtype=torch.long) for row in df["Tokens"]]
         
+        '''
         self.segments = [
             document[offset : offset + self.seq_length - 2]
             for document in documents
             for offset in range(0, len(document), self.seq_length - 2)
             if len(document) > 0 and len(document) - offset > 1
-        ]
+        ]'''
         #if rank is not None:
         #    self.segments = self.segments[rank::world_size]
-        self.counts = [
+        '''self.counts = [
             torch.zeros_like(segment)
             for segment in self.segments
         ]
         self.random_index = RandomIndex(len(self.segments))
-
+        '''
     def __len__(self):
         return len(self.segments)
 
     def __getitem__(self, index):
         tokens = self.segments[index]
-        seq_length = min(self.seq_length, tokens.size(0))
+        seq_length = tokens.size(0)
+        #print('tokens size:', tokens.size(0))
+        '''seq_length = min(self.seq_length, tokens.size(0))
         self.counts[index][:seq_length] += 1
 
         input_ids = torch.cat([
@@ -277,10 +286,18 @@ class CausalDataset(torch.utils.data.Dataset):
         target_ids = torch.cat([
             torch.LongTensor([-100]),
             tokens[:seq_length].long()
-        ])
-        attention_mask = torch.ones(seq_length + 1, seq_length + 1, dtype=torch.bool)
+        ])'''
 
-        while self.seq_length - input_ids.size(0) > 1:
+        input_ids = tokens #[:-1]
+        #print('input_ids size:', input_ids.size(0))
+        target_ids = tokens #[1:]
+
+        pad_index = self.pad_index
+
+        padding_mask = (input_ids != pad_index)
+        #attention_mask = torch.ones(seq_length + 1, seq_length + 1, dtype=torch.bool)
+
+        '''while self.seq_length - input_ids.size(0) > 1:
             index = self.random_index.get_random_index()
             tokens = self.segments[index].long()
             seq_length = min(self.seq_length - input_ids.size(0), tokens.size(0))
@@ -326,16 +343,24 @@ class CausalDataset(torch.utils.data.Dataset):
             attention_mask = torch.block_diag(
                 attention_mask,
                 torch.zeros(padding_length, padding_length, dtype=torch.bool)
-            )
+            ) '''
 
         # make the attention mask causal
-        attention_mask = attention_mask.tril()
-        attention_mask = ~attention_mask
+        #attention_mask = attention_mask.tril()
+        #attention_mask = ~attention_mask
 
+        #input_ids = input_ids[:-1]
+        #target_ids = target_ids[1:]
+        #attention_mask = attention_mask[:-1, :-1]
+        causal_mask = torch.tril(torch.ones(len(input_ids), len(input_ids), dtype=torch.bool))
+        attention_mask = causal_mask & padding_mask.unsqueeze(0) & padding_mask.unsqueeze(1)
+        attention_mask = ~attention_mask
+        #print('attention_mask:', attention_mask.size())
+        attention_mask = attention_mask[:-1, :-1]
         input_ids = input_ids[:-1]
         target_ids = target_ids[1:]
-        attention_mask = attention_mask[:-1, :-1]
-
+        
+        #print('attention_mask:', attention_mask.size())
         return input_ids, target_ids, attention_mask, torch.zeros([])
 
     def set_global_step(self, global_step):
@@ -369,46 +394,49 @@ class ValidationDataset(torch.utils.data.Dataset):
         #documents = torch.load(input_file)
         if isinstance(input_file,pd.DataFrame):
             df = input_file
-            documents = [torch.tensor(eval(row), dtype=torch.long) for row in df["Tokens"]]
-        
+            self.segments = [torch.tensor(eval(row), dtype=torch.long) for row in df["Tokens"]]
+
         elif input_file.endswith(".txt"):
             with open(input_file, "r", encoding="utf-8") as file:
                 lines = file.readlines()
 
-            documents = [torch.tensor(eval(line.split(": ")[1].strip()), dtype=torch.long) for line in lines if line.strip()]
+            self.segments = [torch.tensor(ast.literal_eval(line.strip()), dtype=torch.long)for line in lines if line.strip()]
+            self.segments = self.segments[args.rank::args.world_size]
+            random.seed(args.rank)
+            #self.segments = [torch.tensor(eval(line.split(": ")[1].strip()), dtype=torch.long) for line in lines if line.strip()]
         else:
             print("This dataset only supports txt or dataframe as an input file")
-            
-        self.segments = [
+
+        '''self.segments = [
             document[offset : offset + self.seq_length - 2]
             for document in documents
             for offset in range(0, len(document), self.seq_length - 2)
             if len(document) > 0 and len(document) - offset > 1
-        ]
-        if hasattr(args, "rank"):
-            self.segments = self.segments[args.rank::args.world_size]
-            random.seed(args.rank)
-        else:
-            random.seed(args.seed)
-        random.shuffle(self.segments)
+        ]'''
+        #if input_file.endswith(".txt") and hasattr(args, "rank"):
+        #    self.segments = self.segments[args.rank::args.world_size]
+        #    random.seed(args.rank)
+        #else:
+        #    random.seed(args.seed)
+        #random.shuffle(self.segments)
 
     def __len__(self):
         return len(self.segments)
 
     def __getitem__(self, index):
         tokens = self.segments[index]
-        seq_length = min(self.seq_length - 2, tokens.size(0))
+        #seq_length = min(self.seq_length - 2, tokens.size(0))
 
-        segment = torch.cat([
+        '''segment = torch.cat([
             torch.LongTensor([self.cls_index]),
             tokens[:seq_length].long()
         ])
         attention_mask = torch.ones(seq_length + 1, seq_length + 1, dtype=torch.bool)
+        '''
+        mask_ratios, replacement_tokens = self.masking_strategy(tokens)
+        input_ids, target_ids, real_mask_p = self.apply_mask(tokens, mask_ratios, replacement_tokens)
 
-        mask_ratios, replacement_tokens = self.masking_strategy(segment)
-        input_ids, target_ids, real_mask_p = self.apply_mask(segment, mask_ratios, replacement_tokens)
-
-        padding_length = self.seq_length - segment.size(0) + 1
+        '''padding_length = self.seq_length - segment.size(0) + 1
         if padding_length > 0:
             input_ids = torch.cat([
                 input_ids,
@@ -422,6 +450,9 @@ class ValidationDataset(torch.utils.data.Dataset):
                 attention_mask,
                 torch.zeros(padding_length, padding_length, dtype=torch.bool)
             )
+        '''
+        pad_mask = (input_ids != self.pad_index)
+        attention_mask = pad_mask.unsqueeze(0) & pad_mask.unsqueeze(1)
 
         attention_mask = ~attention_mask
 
